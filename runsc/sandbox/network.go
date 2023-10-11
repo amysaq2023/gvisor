@@ -29,6 +29,7 @@ import (
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/urpc"
@@ -72,6 +73,11 @@ func setupNetwork(conn *urpc.Client, pid int, conf *config.Config) error {
 		}
 	case config.NetworkHost:
 		// Nothing to do here.
+	case config.NetworkPlugin:
+		nsPath := filepath.Join("/proc", strconv.Itoa(pid), "ns/net")
+		if err := initPluginStack(conn, nsPath, conf); err != nil {
+			return fmt.Errorf("failed to initialize external stack, error: %v", err)
+		}
 	default:
 		return fmt.Errorf("invalid network type: %v", conf.Network)
 	}
@@ -323,6 +329,114 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, conf *con
 	if err := conn.Call(boot.NetworkCreateLinksAndRoutes, &args, nil); err != nil {
 		return fmt.Errorf("creating links and routes: %w", err)
 	}
+	return nil
+}
+
+func prepareInitStackArgs(args *boot.InitPluginStackArgs, nsPath string) error {
+	// Join the network namespace that we will be copying.
+	restore, err := joinNetNS(nsPath)
+	if err != nil {
+		return err
+	}
+	defer restore()
+	// Get all interfaces in the namespace.
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return fmt.Errorf("error querying interfaces: %v", err)
+	}
+	if isRoot, _ := isRootNS(); isRoot {
+		return fmt.Errorf("cannot run in with network enabled in root network namespace")
+	}
+	// Collect addresses and routes from the interfaces.
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 {
+			log.Infof("Skipping down interface: %+v", iface)
+			continue
+		}
+		// Skip loopback devices.
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		allAddrs, err := iface.Addrs()
+		if err != nil {
+			return fmt.Errorf("error fetching interface addresses for %q: %v", iface.Name, err)
+		}
+
+		var ipAddrs []*net.IPNet
+		for _, ifaddr := range allAddrs {
+			ipNet, ok := ifaddr.(*net.IPNet)
+			if !ok {
+				return fmt.Errorf("address is not IPNet: %+v", ifaddr)
+			}
+			ipAddrs = append(ipAddrs, ipNet)
+		}
+		if len(ipAddrs) == 0 {
+			log.Warningf("No usable IP addresses found for interface %q, skipping", iface.Name)
+			continue
+		}
+		// routes and gateway
+		routes, defv4, defv6, err := routesForIface(iface)
+		if err != nil {
+			return fmt.Errorf("getting routes for interface %q: %v", iface.Name, err)
+		}
+		if defv4 != nil {
+			if !args.Defaultv4Gateway.Route.Empty() {
+				return fmt.Errorf("more than one default route found, interface: %v, route: %v, default route: %+v", iface.Name, defv4, args.Defaultv4Gateway)
+			}
+			args.Defaultv4Gateway.Route = *defv4
+			args.Defaultv4Gateway.Name = iface.Name
+		}
+
+		if defv6 != nil {
+			if !args.Defaultv6Gateway.Route.Empty() {
+				return fmt.Errorf("more than one default route found, interface: %v, route: %v, default route: %+v", iface.Name, defv6, args.Defaultv6Gateway)
+			}
+			args.Defaultv6Gateway.Route = *defv6
+			args.Defaultv6Gateway.Name = iface.Name
+		}
+
+		link := boot.FDBasedLink{
+			Name:   iface.Name,
+			MTU:    iface.MTU,
+			Routes: routes,
+		}
+
+		for _, addr := range ipAddrs {
+			prefix, _ := addr.Mask.Size()
+			link.Addresses = append(link.Addresses, boot.IPWithPrefix{Address: addr.IP, PrefixLen: prefix})
+			// Don't erase the address, as we will down the
+			// interface later
+		}
+
+		args.FDBasedLinks = append(args.FDBasedLinks, link)
+	}
+	return nil
+}
+
+func initPluginStack(conn *urpc.Client, nsPath string, conf *config.Config) error {
+	pluginStack := plugin.GetPluginStack()
+	if pluginStack == nil {
+		return fmt.Errorf("Plugin stack is not registered")
+	}
+
+	if err := pluginStack.PreInit(&plugin.PreInitStackArgs{}); err != nil {
+		return fmt.Errorf("Plugin stack PreInit failed: %v", err)
+	}
+
+	var args boot.InitPluginStackArgs
+	if err := prepareInitStackArgs(&args, nsPath); err != nil {
+		return err
+	}
+
+	log.Debugf("Initializing plugin network stack, config: %+v", args)
+	if err := conn.Call(boot.NetworkInitPluginStack, &args, nil); err != nil {
+		return fmt.Errorf("error initializing plugin netstack: %v", err)
+	}
+
+	if err := pluginStack.PostInit(&plugin.PostInitStackArgs{}); err != nil {
+		return fmt.Errorf("Plugin stack PostInit failed: %v", err)
+	}
+
 	return nil
 }
 

@@ -33,7 +33,9 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
+	"gvisor.dev/gvisor/pkg/sentry/socket/externalstack"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
+	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
 	"gvisor.dev/gvisor/pkg/sentry/state"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -108,6 +110,9 @@ const (
 const (
 	// NetworkCreateLinksAndRoutes creates links and routes in a network stack.
 	NetworkCreateLinksAndRoutes = "Network.CreateLinksAndRoutes"
+
+	// NetworkInitPluginStack initializes third-party network stack.
+	NetworkInitPluginStack = "Network.InitPluginStack"
 
 	// DebugStacks collects sandbox stacks for debugging.
 	DebugStacks = "debug.Stacks"
@@ -190,6 +195,11 @@ func newController(fd int, l *Loader) (*controller, error) {
 	if eps, ok := l.k.RootNetworkNamespace().Stack().(*netstack.Stack); ok {
 		ctrl.srv.Register(&Network{Stack: eps.Stack})
 	}
+
+	if pluginStack := plugin.GetPluginStack(); pluginStack != nil {
+		ctrl.srv.Register(&Network{PluginStack: pluginStack})
+	}
+
 	if l.root.conf.ProfileEnable {
 		ctrl.srv.Register(control.NewProfile(l.k))
 	}

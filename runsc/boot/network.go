@@ -25,6 +25,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostos"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/link/ethernet"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
@@ -69,6 +70,10 @@ var (
 // Network exposes methods that can be used to configure a network stack.
 type Network struct {
 	Stack *stack.Stack
+
+	// PluginStack is a third-party network stack to use in place of
+	// netstack when non-nil.
+	PluginStack plugin.PluginStack
 }
 
 // Route represents a route in the network stack.
@@ -154,6 +159,16 @@ type CreateLinksAndRoutesArgs struct {
 	PCAP bool
 }
 
+type InitPluginStackArgs struct {
+	urpc.FilePayload
+
+	LoopbackLinks []LoopbackLink
+	FDBasedLinks  []FDBasedLink
+
+	Defaultv4Gateway DefaultRoute
+	Defaultv6Gateway DefaultRoute
+}
+
 // IPWithPrefix is an address with its subnet prefix length.
 type IPWithPrefix struct {
 	// Address is a network address.
@@ -182,6 +197,18 @@ func (r *Route) toTcpipRoute(id tcpip.NICID) (tcpip.Route, error) {
 		Gateway:     ipToAddress(r.Gateway),
 		NIC:         id,
 	}, nil
+}
+
+func (n *Network) InitPluginStack(args *InitPluginStackArgs, _ *struct{}) error {
+	pluginStack := n.PluginStack
+	if pluginStack == nil {
+		return fmt.Errorf("Plugin stack is not registered")
+	}
+
+	if err := pluginStack.Init(&plugin.InitStackArgs{}); err != nil {
+		return err
+	}
+	return nil
 }
 
 // CreateLinksAndRoutes creates links and routes in a network stack.  It should

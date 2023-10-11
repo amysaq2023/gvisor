@@ -521,6 +521,9 @@ const (
 
 	// NetworkNone sets up just loopback using netstack.
 	NetworkNone
+
+	// NetworkPlugin uses third-party network stack.
+	NetworkPlugin
 )
 
 func networkTypePtr(v NetworkType) *NetworkType {
